@@ -39,13 +39,22 @@ public class ReferenceProvider {
     }
 
     private List<Location> findFull() {
+        // 먼저 lean importRoots(커서+import)로 해석 시도. 해석 실패(null)면 full neighborhood로 폴백.
+        var r = resolveAndDispatch(importRoots(file));
+        if (r != null) return r;
+        r = resolveAndDispatch(neighborhood(file));
+        return r != null ? r : NOT_SUPPORTED;
+    }
+
+    // roots를 컴파일해 커서 심볼을 해석하고 종류별로 디스패치. 해석 실패면 null(폴백 신호), 해석했으나 미지원 종류면 빈 리스트.
+    private List<Location> resolveAndDispatch(Path[] roots) {
         var c0 = System.nanoTime();
-        try (var task = compiler.compile(neighborhood(file))) {
+        try (var task = compiler.compile(roots)) {
             var c1 = System.nanoTime();
             var element = NavigationHelper.findElement(task, file, line, column);
-            LOG.info(String.format("PERF find: cursorCompile=%dms element=%s",
-                (c1-c0)/1000000, element==null?"NULL":element.getKind()));
-            if (element == null) return NOT_SUPPORTED;
+            LOG.info(String.format("PERF find: cursorCompile=%dms roots=%d element=%s",
+                (c1-c0)/1000000, roots.length, element==null?"NULL":element.getKind()));
+            if (element == null) return null;   // 폴백 신호
             if (NavigationHelper.isLocal(element)) {
                 return findReferences(task);
             }
