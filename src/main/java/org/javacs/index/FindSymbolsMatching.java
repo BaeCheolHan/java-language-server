@@ -18,6 +18,7 @@ class FindSymbolsMatching extends TreePathScanner<Void, List<SymbolInformation>>
     private final String query;
     private CompilationUnitTree root;
     private CharSequence containerName;
+    private CharSequence source;   // 파일 소스(nameLocation용) — 컴파일유닛에서 1회만 읽음
 
     FindSymbolsMatching(ParseTask task, String query) {
         this.task = task;
@@ -28,6 +29,11 @@ class FindSymbolsMatching extends TreePathScanner<Void, List<SymbolInformation>>
     public Void visitCompilationUnit(CompilationUnitTree t, List<SymbolInformation> list) {
         root = t;
         containerName = Objects.toString(t.getPackageName(), "");
+        try {
+            source = t.getSourceFile().getCharContent(true);
+        } catch (Exception e) {
+            source = null;
+        }
         return super.visitCompilationUnit(t, list);
     }
 
@@ -37,7 +43,7 @@ class FindSymbolsMatching extends TreePathScanner<Void, List<SymbolInformation>>
             var info = new SymbolInformation();
             info.name = t.getSimpleName().toString();
             info.kind = asSymbolKind(t.getKind());
-            info.location = location(t);
+            info.location = nameLocation(t, t.getModifiers(), info.name);
             info.containerName = containerName.toString();
             list.add(info);
         }
@@ -54,7 +60,9 @@ class FindSymbolsMatching extends TreePathScanner<Void, List<SymbolInformation>>
             var info = new SymbolInformation();
             info.name = t.getName().toString();
             info.kind = asSymbolKind(t.getKind());
-            info.location = location(t);
+            // 생성자(name="<init>")는 소스에 없으므로 enclosing 클래스명으로 이름 위치를 찾는다.
+            var searchName = t.getName().contentEquals("<init>") ? containerName.toString() : info.name;
+            info.location = nameLocation(t, t.getModifiers(), searchName);
             info.containerName = containerName.toString();
             list.add(info);
         }
@@ -72,7 +80,7 @@ class FindSymbolsMatching extends TreePathScanner<Void, List<SymbolInformation>>
             var info = new SymbolInformation();
             info.name = t.getName().toString();
             info.kind = asSymbolKind(t.getKind());
-            info.location = location(t);
+            info.location = nameLocation(t, t.getModifiers(), info.name);
             info.containerName = containerName.toString();
             list.add(info);
         }
@@ -117,5 +125,47 @@ class FindSymbolsMatching extends TreePathScanner<Void, List<SymbolInformation>>
         var endColumn = (int) lines.getColumnNumber(end);
         var range = new Range(new Position(startLine - 1, startColumn - 1), new Position(endLine - 1, endColumn - 1));
         return new Location(root.getSourceFile().toUri(), range);
+    }
+
+    // FIX: 심볼 위치를 선언 전체 시작(수식어/애노테이션)이 아니라 "이름 식별자"로 반환.
+    // 그래야 클라이언트가 이 위치에서 findReferences 할 때 심볼이 해석된다(선언 시작을 질의하면 element=NULL).
+    // 검색은 modifiers(애노테이션 포함) 끝부터 시작 → @Column(name="startTime") 같은 애노테이션 문자열 오매칭 방지.
+    private Location nameLocation(Tree t, ModifiersTree mods, String name) {
+        if (source == null || name == null || name.isEmpty()) return location(t);
+        var trees = Trees.instance(task.task);
+        var pos = trees.getSourcePositions();
+        var lines = task.root.getLineMap();
+        long start = pos.getStartPosition(root, t);
+        long end = pos.getEndPosition(root, t);
+        if (start < 0 || end < 0) return location(t);
+        long from = start;
+        if (mods != null) {
+            long modEnd = pos.getEndPosition(root, mods);
+            if (modEnd >= start) from = modEnd;   // 애노테이션/수식어 뒤부터
+        }
+        long namePos = findWord(source, name, (int) from, (int) end);
+        if (namePos < 0) return location(t);
+        long nameEnd = namePos + name.length();
+        var range = new Range(
+                new Position((int) lines.getLineNumber(namePos) - 1, (int) lines.getColumnNumber(namePos) - 1),
+                new Position((int) lines.getLineNumber(nameEnd) - 1, (int) lines.getColumnNumber(nameEnd) - 1));
+        return new Location(root.getSourceFile().toUri(), range);
+    }
+
+    // [from, to) 범위에서 name을 "완전한 식별자"(앞뒤가 식별자 문자가 아님)로 처음 등장하는 위치.
+    private static int findWord(CharSequence s, String w, int from, int to) {
+        to = Math.min(to, s.length());
+        int wl = w.length();
+        if (wl == 0) return -1;
+        for (int i = Math.max(0, from); i + wl <= to; i++) {
+            if (i > 0 && Character.isJavaIdentifierPart(s.charAt(i - 1))) continue;
+            int k = 0;
+            while (k < wl && s.charAt(i + k) == w.charAt(k)) k++;
+            if (k != wl) continue;
+            int after = i + wl;
+            if (after < s.length() && Character.isJavaIdentifierPart(s.charAt(after))) continue;
+            return i;
+        }
+        return -1;
     }
 }
