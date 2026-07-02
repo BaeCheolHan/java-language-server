@@ -76,6 +76,11 @@ public class LanguageServer {
         throw new RuntimeException("Unimplemented");
     }
 
+    // 커스텀: 워크스페이스(또는 params.files) 전체 참조 엣지를 배치 추출(인버티드). 기본은 미지원(빈 목록).
+    public Object indexReferences(com.google.gson.JsonElement params) {
+        return java.util.List.of();
+    }
+
     public List<SymbolInformation> workspaceSymbols(WorkspaceSymbolParams params) {
         throw new RuntimeException("Unimplemented");
     }

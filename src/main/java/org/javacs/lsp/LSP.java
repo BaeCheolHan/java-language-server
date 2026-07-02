@@ -398,6 +398,12 @@ public class LSP {
                             respond(send, r.id, response);
                             break;
                         }
+                    case "java/indexReferences":
+                        {
+                            var response = server.indexReferences(r.params);
+                            respond(send, r.id, response);
+                            break;
+                        }
                     case "textDocument/codeAction":
                         {
                             var params = gson.fromJson(r.params, CodeActionParams.class);

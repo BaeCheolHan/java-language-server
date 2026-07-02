@@ -348,6 +348,25 @@ class JavaLanguageServer extends LanguageServer {
         return new SymbolProvider(compiler()).documentSymbols(file);
     }
 
+    // 커스텀: 인버티드 배치 참조 추출. params.files(상대경로 목록)가 있으면 그 파일들만 walk(증분),
+    // 없으면 워크스페이스 전체를 컴파일·walk(초기 배치). 결과=참조 엣지 목록(sari가 DB에 저장).
+    @Override
+    public Object indexReferences(com.google.gson.JsonElement params) {
+        Objects.requireNonNull(workspaceRoot, "workspaceRoot has not been initialized");
+        var all = new ArrayList<Path>();
+        for (var f : FileStore.all()) {
+            if (f.startsWith(workspaceRoot)) all.add(f);
+        }
+        java.util.Set<Path> walk = null;
+        if (params != null && params.isJsonObject() && params.getAsJsonObject().has("files")) {
+            walk = new java.util.HashSet<>();
+            for (var e : params.getAsJsonObject().getAsJsonArray("files")) {
+                walk.add(workspaceRoot.resolve(e.getAsString()));
+            }
+        }
+        return new org.javacs.index.ReferenceIndexer(compiler(), workspaceRoot).index(all, walk);
+    }
+
     @Override
     public List<CodeLens> codeLens(CodeLensParams params) {
         if (!FileStore.isJavaFile(params.textDocument.uri)) return List.of();
