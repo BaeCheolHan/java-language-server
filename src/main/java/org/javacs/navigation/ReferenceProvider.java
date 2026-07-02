@@ -3,7 +3,13 @@ package org.javacs.navigation;
 import com.sun.source.util.TreePath;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Set;
+import javax.lang.model.element.Element;
+import javax.lang.model.element.ElementKind;
+import javax.lang.model.element.Modifier;
 import javax.lang.model.element.TypeElement;
 import org.javacs.CompileTask;
 import org.javacs.CompilerProvider;
@@ -55,7 +61,17 @@ public class ReferenceProvider {
             LOG.info(String.format("PERF find: cursorCompile=%dms roots=%d element=%s",
                 (c1-c0)/1000000, roots.length, element==null?"NULL":element.getKind()));
             if (element == null) return null;   // 폴백 신호
-            if (NavigationHelper.isLocal(element)) {
+            // 필드: private이어도 public 접근자(Lombok get/is/set) 호출이 타 파일에 있을 수 있으므로,
+            // 접근자가 있거나 비-private이면 isLocal(단일 파일)보다 먼저 크로스파일 + 접근자 스캔으로 라우팅.
+            if (element.getKind() == ElementKind.FIELD
+                    && element.getEnclosingElement() instanceof TypeElement parentClass
+                    && fieldNeedsCrossFile(element)) {
+                var className = parentClass.getQualifiedName().toString();
+                var fieldName = element.getSimpleName().toString();
+                task.close();
+                return findFieldReferences(className, fieldName);
+            }
+            if (NavigationHelper.isLocal(element)) {   // 순수 private 필드/로컬 변수 → 단일 파일
                 return findReferences(task);
             }
             if (NavigationHelper.isType(element)) {
@@ -64,7 +80,7 @@ public class ReferenceProvider {
                 task.close();
                 return findTypeReferences(className);
             }
-            if (NavigationHelper.isMember(element)) {
+            if (NavigationHelper.isMember(element)) {   // 메서드/생성자/enum 상수
                 var parentClass = (TypeElement) element.getEnclosingElement();
                 var className = parentClass.getQualifiedName().toString();
                 var memberName = element.getSimpleName().toString();
@@ -207,15 +223,81 @@ public class ReferenceProvider {
     }
 
     private List<Location> findReferences(CompileTask task) {
-        var element = NavigationHelper.findElement(task, file, line, column);
+        var out = new ArrayList<Location>();
+        addReferences(task, NavigationHelper.findElement(task, file, line, column), out, new LinkedHashSet<>());
+        return out;
+    }
+
+    // 필드 참조 + 그 필드의 접근자(getX/isX/setX) 참조를 함께 수집. Lombok 생성 게터는 소스에 없어
+    // "위치 질의"가 불가능하므로, 스캔 task에서 필드의 enclosing 타입 멤버 중 접근자를 찾아 element 동등성으로 스캔한다.
+    private List<Location> findFieldReferences(String className, String fieldName) {
+        var t0 = System.nanoTime();
+        var accessors = accessorNames(fieldName);
+        var set = new LinkedHashSet<Path>();
+        Collections.addAll(set, withDeclaringFile(className, compiler.findMemberReferences(className, fieldName)));
+        for (var a : accessors) {
+            Collections.addAll(set, compiler.findMemberReferences(className, a));
+        }
+        var files = set.toArray(Path[]::new);
+        var t1 = System.nanoTime();
+        if (files.length == 0) return List.of();
+        try (var task = compiler.compile(files)) {
+            var t2 = System.nanoTime();
+            var out = new ArrayList<Location>();
+            var seen = new LinkedHashSet<String>();
+            var fieldEl = NavigationHelper.findElement(task, file, line, column);
+            addReferences(task, fieldEl, out, seen);            // 필드 자체 참조
+            if (fieldEl != null && fieldEl.getEnclosingElement() instanceof TypeElement type) {
+                for (var el : type.getEnclosedElements()) {      // Lombok 생성 게터 포함(컴파일됨)
+                    if (el.getKind() == ElementKind.METHOD && accessors.contains(el.getSimpleName().toString())) {
+                        addReferences(task, el, out, seen);
+                    }
+                }
+            }
+            var t3 = System.nanoTime();
+            LOG.info(String.format("PERF field %s#%s(+accessors): candidates=%d narrow=%dms compile=%dms scan=%dms refs=%d",
+                className, fieldName, files.length, (t1-t0)/1000000, (t2-t1)/1000000, (t3-t2)/1000000, out.size()));
+            return out;
+        }
+    }
+
+    // 필드가 크로스파일 스캔이 필요한가: 비-private이거나(직접 참조 가능), 접근자(get/is/set)를 가짐(접근자 호출이 타 파일에).
+    private static boolean fieldNeedsCrossFile(Element field) {
+        if (!field.getModifiers().contains(Modifier.PRIVATE)) return true;
+        var accessors = accessorNames(field.getSimpleName().toString());
+        if (field.getEnclosingElement() instanceof TypeElement type) {
+            for (var el : type.getEnclosedElements()) {
+                if (el.getKind() == ElementKind.METHOD && accessors.contains(el.getSimpleName().toString())) return true;
+            }
+        }
+        return false;
+    }
+
+    // 필드명 xxx -> 접근자 후보. 표준은 getXxx/isXxx/setXxx.
+    // Lombok은 "isXxx"로 명명된 boolean 필드의 게터를 isXxx(필드명 그대로), 세터를 setXxx(is 제거)로 만든다.
+    private static List<String> accessorNames(String field) {
+        if (field.isEmpty()) return List.of();
+        var cap = Character.toUpperCase(field.charAt(0)) + field.substring(1);
+        var names = new ArrayList<String>(List.of("get" + cap, "is" + cap, "set" + cap));
+        if (field.length() > 2 && field.startsWith("is") && Character.isUpperCase(field.charAt(2))) {
+            var rest = field.substring(2);   // isActive -> "Active"
+            names.add(field);                // 게터 = isActive (필드명)
+            names.add("set" + rest);         // 세터 = setActive
+        }
+        return names;
+    }
+
+    // element의 참조를 스캔해 out에 추가(위치 기준 dedup).
+    private void addReferences(CompileTask task, Element element, List<Location> out, Set<String> seen) {
+        if (element == null) return;
         var paths = new ArrayList<TreePath>();
         for (var root : task.roots) {
             new FindReferences(task.task, element).scan(root, paths);
         }
-        var locations = new ArrayList<Location>();
         for (var p : paths) {
-            locations.add(FindHelper.location(task, p));
+            var loc = FindHelper.location(task, p);
+            var key = loc.uri + ":" + loc.range.start.line + ":" + loc.range.start.character;
+            if (seen.add(key)) out.add(loc);
         }
-        return locations;
     }
 }
