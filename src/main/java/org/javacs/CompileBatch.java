@@ -125,6 +125,9 @@ class CompileBatch implements AutoCloseable {
             Collections.addAll(list, "-processorpath", lombokJar);
         }
         Collections.addAll(list, "-g");
+        // 배치 참조 추출: 에러 하나가 100개 상한을 넘겨 javac가 어트리뷰션을 통째로 중단(→대량 손실)하는 걸 방지.
+        // 상한을 크게 두면 깨진 심볼 관련만 부분 손실되고 나머지는 정상 해석된다.
+        Collections.addAll(list, "-Xmaxerrs", "100000", "-Xmaxwarns", "100000");
         // You would think we could do -Xlint:all,
         // but some lints trigger fatal errors in the presence of parse errors
         Collections.addAll(
