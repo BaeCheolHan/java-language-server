@@ -95,7 +95,7 @@ public class FileStore {
         javaSources.clear();
     }
 
-    static List<Path> list(String packageName) {
+    public static List<Path> list(String packageName) {
         var list = new ArrayList<Path>();
         for (var file : javaSources.keySet()) {
             if (javaSources.get(file).packageName.equals(packageName)) {

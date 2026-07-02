@@ -118,7 +118,12 @@ class CompileBatch implements AutoCloseable {
         Collections.addAll(list, "-classpath", joinPath(classPath));
         Collections.addAll(list, "--add-modules", "ALL-MODULE-PATH");
         // Collections.addAll(list, "-verbose");
-        Collections.addAll(list, "-proc:none");
+        Collections.addAll(list, "-proc:full");
+        // PERF/FIX: 프로젝트가 핀한 구버전 lombok(JDK21에서 크래시)을 피하려 최신 lombok을 processorpath로 주입.
+        var lombokJar = System.getenv("LOMBOK_JAR");
+        if (lombokJar != null && !lombokJar.isBlank()) {
+            Collections.addAll(list, "-processorpath", lombokJar);
+        }
         Collections.addAll(list, "-g");
         // You would think we could do -Xlint:all,
         // but some lints trigger fatal errors in the presence of parse errors

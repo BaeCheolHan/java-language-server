@@ -323,15 +323,40 @@ class JavaCompilerService implements CompilerProvider {
         return candidates.toArray(Path[]::new);
     }
 
+    // PERF(B1): inverted identifier index (word -> files). Built lazily once; replaces the per-query
+    // O(all files) text scan in findMemberReferences. NOTE prototype: not yet incrementally invalidated.
+    private Map<String, Set<Path>> wordIndex;
+
+    private synchronized Map<String, Set<Path>> wordIndex() {
+        if (wordIndex == null) {
+            var t0 = System.nanoTime();
+            var idx = new HashMap<String, Set<Path>>();
+            var pat = Pattern.compile("[A-Za-z_$][A-Za-z0-9_$]*");
+            var files = 0;
+            for (var file : FileStore.all()) {
+                try {
+                    var text = Files.readString(file);
+                    var m = pat.matcher(text);
+                    var seen = new HashSet<String>();
+                    while (m.find()) seen.add(m.group());
+                    for (var w : seen) idx.computeIfAbsent(w, k -> new HashSet<>()).add(file);
+                    files++;
+                } catch (java.io.IOException e) {
+                    // skip unreadable file
+                }
+            }
+            wordIndex = idx;
+            LOG.info(String.format("PERF wordIndex built: files=%d words=%d in %dms",
+                files, idx.size(), (System.nanoTime() - t0) / 1000000));
+        }
+        return wordIndex;
+    }
+
     @Override
     public Path[] findMemberReferences(String className, String memberName) {
-        var candidates = new ArrayList<Path>();
-        for (var f : FileStore.all()) {
-            if (containsWord(f, memberName)) {
-                candidates.add(f);
-            }
-        }
-        return candidates.toArray(Path[]::new);
+        var set = wordIndex().get(memberName);
+        if (set == null) return new Path[0];
+        return set.toArray(Path[]::new);
     }
 
     @Override

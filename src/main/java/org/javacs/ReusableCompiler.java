@@ -110,6 +110,13 @@ class ReusableCompiler {
         checkedOut = true;
         List<String> opts =
                 StreamSupport.stream(options.spliterator(), false).collect(Collectors.toCollection(ArrayList::new));
+        if (opts.contains("-proc:full") || opts.contains("-proc:only")) {
+            JavacTaskImpl apTask =
+                    (JavacTaskImpl)
+                            systemProvider.getTask(
+                                    null, fileManager, diagnosticListener, opts, classes, compilationUnits);
+            return new Borrow(apTask, null);
+        }
         if (!opts.equals(currentOptions)) {
             LOG.warning(String.format("Options changed from %s to %s, creating new compiler", options, opts));
             currentOptions = opts;
@@ -131,10 +138,12 @@ class ReusableCompiler {
 
     class Borrow implements AutoCloseable {
         final JavacTask task;
+        final ReusableContext ctx;
         boolean closed;
 
         Borrow(JavacTask task, ReusableContext ctx) {
             this.task = task;
+            this.ctx = ctx;
         }
 
         @Override
@@ -142,7 +151,9 @@ class ReusableCompiler {
             if (closed) return;
             // not returning the context to the pool if task crashes with an exception
             // the task/context may be in a broken state
-            currentContext.clear();
+            if (ctx != null) {
+                ctx.clear();
+            }
             try {
                 var method = JavacTaskImpl.class.getDeclaredMethod("cleanup");
                 method.setAccessible(true);

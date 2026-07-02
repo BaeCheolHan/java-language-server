@@ -97,7 +97,7 @@ class InferConfig {
         // Maven
         var pomXml = workspaceRoot.resolve("pom.xml");
         if (Files.exists(pomXml)) {
-            return mvnDependencies(pomXml, "dependency:list", this.envVars);
+            return mvnDependenciesCached(pomXml, "dependency:list", this.envVars);
         }
 
         // Bazel
@@ -138,7 +138,9 @@ class InferConfig {
         // Maven
         var pomXml = workspaceRoot.resolve("pom.xml");
         if (Files.exists(pomXml)) {
-            return mvnDependencies(pomXml, "dependency:sources", this.envVars);
+            // PERF: source jars are only used for hover/goto-into-libraries, not for references/indexing.
+            // Skipping the extra `mvn dependency:sources` invocation (and source-jar downloads) speeds cold start.
+            return Collections.emptySet();
         }
 
         // Bazel
@@ -199,6 +201,39 @@ class InferConfig {
 
     private String fileName(Artifact artifact, boolean source) {
         return artifact.artifactId + '-' + artifact.version + (source ? "-sources" : "") + ".jar";
+    }
+
+    // PERF(A3): cache the resolved classpath on disk keyed by pom.xml mtime, so unchanged projects
+    // skip the ~1.6s `mvn dependency:list` subprocess on cold start.
+    static Set<Path> mvnDependenciesCached(Path pomXml, String goal, Map<String, String> envVars) {
+        try {
+            var abs = pomXml.toAbsolutePath();
+            var mtime = Files.getLastModifiedTime(abs).toMillis();
+            var cacheDir = Paths.get(System.getProperty("user.home"), ".cache", "javacs-classpath");
+            Files.createDirectories(cacheDir);
+            var key = Integer.toHexString(abs.toString().hashCode()) + "-" + goal.replace(':', '_') + ".txt";
+            var cacheFile = cacheDir.resolve(key);
+            if (Files.exists(cacheFile)) {
+                var lines = Files.readAllLines(cacheFile);
+                if (!lines.isEmpty() && lines.get(0).equals("mtime=" + mtime)) {
+                    var deps = new HashSet<Path>();
+                    for (var i = 1; i < lines.size(); i++) {
+                        if (!lines.get(i).isBlank()) deps.add(Paths.get(lines.get(i)));
+                    }
+                    LOG.info("Using cached classpath (" + deps.size() + " jars) for " + abs);
+                    return deps;
+                }
+            }
+            var deps = mvnDependencies(pomXml, goal, envVars);
+            var out = new ArrayList<String>();
+            out.add("mtime=" + mtime);
+            for (var d : deps) out.add(d.toString());
+            Files.write(cacheFile, out);
+            return deps;
+        } catch (IOException e) {
+            LOG.warning("classpath cache failed, falling back to mvn: " + e.getMessage());
+            return mvnDependencies(pomXml, goal, envVars);
+        }
     }
 
     static Set<Path> mvnDependencies(Path pomXml, String goal, Map<String, String> envVars) {
