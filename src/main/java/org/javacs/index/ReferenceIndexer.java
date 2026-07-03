@@ -70,9 +70,11 @@ public class ReferenceIndexer {
      */
     public List<Edge> index(Collection<Path> compileFiles, Set<Path> walkFiles) {
         if (compileFiles.isEmpty()) return List.of();
+        long tStart = System.nanoTime();
         try (var task = compiler.compile(compileFiles.toArray(Path[]::new))) {
             var trees = Trees.instance(task.task);
             var pos = trees.getSourcePositions();
+            long tCompiled = System.nanoTime();
 
             // pass 1: 선언 → 타겟키 맵 (선언 트리에서 nameLocation 직접 계산; element identity 키)
             var declKey = new HashMap<Element, String[]>();  // element -> [relpath, name, kind, line, col]
@@ -81,6 +83,7 @@ public class ReferenceIndexer {
                 if (!declFile.startsWith(workspaceRoot)) continue;
                 buildDeclKeys(cu, trees, pos, declFile, declKey);
             }
+            long tPass1 = System.nanoTime();
 
             // pass 2: 참조 노드 → 타겟 element → declKey 조회(생성자/Lombok 접근자 매핑 포함) → 엣지
             var edges = new ArrayList<Edge>();
@@ -91,8 +94,10 @@ public class ReferenceIndexer {
                 if (!refFile.startsWith(workspaceRoot)) continue;
                 collectRefs(cu, trees, pos, declKey, workspaceRoot.relativize(refFile).toString(), edges, seen);
             }
-            LOG.info(String.format("ReferenceIndexer: compiled=%d declSymbols=%d edges=%d",
-                    compileFiles.size(), declKey.size(), edges.size()));
+            long tPass2 = System.nanoTime();
+            LOG.info(String.format("ReferenceIndexer: compiled=%d declSymbols=%d edges=%d | compileMs=%d pass1Ms=%d pass2Ms=%d",
+                    compileFiles.size(), declKey.size(), edges.size(),
+                    (tCompiled - tStart) / 1_000_000L, (tPass1 - tCompiled) / 1_000_000L, (tPass2 - tPass1) / 1_000_000L));
             return edges;
         }
     }
@@ -100,11 +105,16 @@ public class ReferenceIndexer {
     private void buildDeclKeys(CompilationUnitTree cu, Trees trees, SourcePositions pos, Path declFile,
                                Map<Element, String[]> declKey) {
         final String rel = workspaceRoot.relativize(declFile).toString();
+        // 소스 텍스트는 파일당 1회만 읽는다(선언마다 getCharContent→디스크 재읽기 방지 — pass1의 지배적 비용).
+        final CharSequence src;
+        CharSequence tmp;
+        try { tmp = cu.getSourceFile().getCharContent(true); } catch (Exception e) { tmp = null; }
+        src = tmp;
         new TreePathScanner<Void, Void>() {
             void decl(Tree t, ModifiersTree mods, String kind, String keyName, String searchName) {
                 var el = trees.getElement(getCurrentPath());
                 if (el == null) return;
-                int[] lc = nameLocation(pos, cu, t, mods, searchName);
+                int[] lc = nameLocation(pos, cu, src, t, mods, searchName);
                 if (lc == null) return;
                 declKey.putIfAbsent(el, new String[]{rel, keyName, kind, String.valueOf(lc[0]), String.valueOf(lc[1])});
             }
@@ -197,13 +207,11 @@ public class ReferenceIndexer {
     // 이름을 소스에서 못 찾으면 null(=키 안 함). 이게 Lombok "생성 멤버 필터" 역할을 한다:
     // 컴파일 task엔 Lombok이 게터/세터를 AST에 주입하지만 그 이름은 소스 텍스트에 없어 findWord가 실패 → null →
     // 키 안 됨 → 참조 pass에서 accessorField로 밑 필드에 매핑됨. (documentSymbol은 parse 기반이라 생성 멤버가 아예 없음 → 일관)
-    private static int[] nameLocation(SourcePositions pos, CompilationUnitTree cu, Tree t, ModifiersTree mods, String name) {
+    private static int[] nameLocation(SourcePositions pos, CompilationUnitTree cu, CharSequence src, Tree t, ModifiersTree mods, String name) {
         if (name == null || name.isEmpty()) return null;
+        if (src == null) return null;
         long start = pos.getStartPosition(cu, t), end = pos.getEndPosition(cu, t);
         if (start < 0 || end < 0) return null;
-        CharSequence src;
-        try { src = cu.getSourceFile().getCharContent(true); } catch (Exception e) { return null; }
-        if (src == null) return null;
         long from = start;
         if (mods != null) { long m = pos.getEndPosition(cu, mods); if (m >= start) from = m; }
         int np = findWord(src, name, (int) from, (int) end);
