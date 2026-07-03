@@ -348,23 +348,51 @@ class JavaLanguageServer extends LanguageServer {
         return new SymbolProvider(compiler()).documentSymbols(file);
     }
 
-    // 커스텀: 인버티드 배치 참조 추출. params.files(상대경로 목록)가 있으면 그 파일들만 walk(증분),
-    // 없으면 워크스페이스 전체를 컴파일·walk(초기 배치). 결과=참조 엣지 목록(sari가 DB에 저장).
+    // 커스텀: 인버티드 배치 참조 추출.
+    // params.files 없음 → 워크스페이스 전체 컴파일·walk(초기 배치).
+    // params.files 있음 → 그 파일들만 walk하고, 컴파일은 "변경파일 + 이웃(import/동일패키지)"만(증분, 빠름).
     @Override
     public Object indexReferences(com.google.gson.JsonElement params) {
         Objects.requireNonNull(workspaceRoot, "workspaceRoot has not been initialized");
-        var all = new ArrayList<Path>();
-        for (var f : FileStore.all()) {
-            if (f.startsWith(workspaceRoot)) all.add(f);
-        }
         java.util.Set<Path> walk = null;
         if (params != null && params.isJsonObject() && params.getAsJsonObject().has("files")) {
-            walk = new java.util.HashSet<>();
+            walk = new java.util.LinkedHashSet<>();
             for (var e : params.getAsJsonObject().getAsJsonArray("files")) {
-                walk.add(workspaceRoot.resolve(e.getAsString()));
+                var p = workspaceRoot.resolve(e.getAsString());
+                if (FileStore.isJavaFile(p) && java.nio.file.Files.isRegularFile(p)) walk.add(p);
             }
         }
-        return new org.javacs.index.ReferenceIndexer(compiler(), workspaceRoot).index(all, walk);
+        List<Path> compileFiles;
+        if (walk == null) {
+            compileFiles = new ArrayList<>();
+            for (var f : FileStore.all()) {
+                if (f.startsWith(workspaceRoot)) compileFiles.add(f);
+            }
+        } else {
+            var set = new java.util.LinkedHashSet<Path>(walk);
+            for (var f : walk) addNeighborhood(f, set);
+            compileFiles = new ArrayList<>(set);
+        }
+        return new org.javacs.index.ReferenceIndexer(compiler(), workspaceRoot).index(compileFiles, walk);
+    }
+
+    // 증분 컴파일 범위: 파일 + import 대상 소스 + 동일 패키지(타겟 해석에 필요).
+    private void addNeighborhood(Path f, java.util.Set<Path> out) {
+        try {
+            var text = java.nio.file.Files.readString(f);
+            var pkg = java.util.regex.Pattern.compile("(?m)^\\s*package\\s+([\\w.]+)\\s*;").matcher(text);
+            if (pkg.find()) {
+                for (var p : FileStore.list(pkg.group(1))) out.add(p);
+            }
+            var imp = java.util.regex.Pattern.compile("(?m)^\\s*import\\s+(?:static\\s+)?([\\w.]+)\\s*;").matcher(text);
+            while (imp.find()) {
+                var fqn = imp.group(1);
+                if (fqn.endsWith(".*")) continue;
+                var decl = compiler().findTypeDeclaration(fqn);
+                if (decl != null && java.nio.file.Files.isRegularFile(decl)) out.add(decl);
+            }
+        } catch (Exception ignored) {
+        }
     }
 
     @Override
