@@ -91,10 +91,12 @@ class FindSymbolsMatching extends TreePathScanner<Void, List<SymbolInformation>>
         return null;
     }
 
-    private static Integer asSymbolKind(Tree.Kind k) {
+    // 반환은 primitive int(SymbolInformation.kind가 int) — null 반환 시 언박싱 NPE로 LSP가 크래시했음.
+    private static int asSymbolKind(Tree.Kind k) {
         switch (k) {
             case ANNOTATION_TYPE:
             case CLASS:
+            case RECORD:   // Java 16+ 레코드: 누락 시 null→NPE로 심볼 인덱싱 중 LSP 프로세스 크래시
                 return SymbolKind.Class;
             case ENUM:
                 return SymbolKind.Enum;
@@ -109,7 +111,7 @@ class FindSymbolsMatching extends TreePathScanner<Void, List<SymbolInformation>>
                 // where we only return fields, not local variables
                 return SymbolKind.Field;
             default:
-                return null;
+                return SymbolKind.Class;   // 미지 kind 폴백 — 절대 null 반환 안 함(크래시 방지)
         }
     }
 

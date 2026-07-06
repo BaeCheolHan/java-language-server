@@ -71,8 +71,10 @@ class CompileBatch implements AutoCloseable {
     private String errorText(javax.tools.Diagnostic<? extends javax.tools.JavaFileObject> err) {
         var file = Paths.get(err.getSource().toUri());
         var contents = FileStore.contents(file);
-        var begin = (int) err.getStartPosition();
-        var end = (int) err.getEndPosition();
+        // 진단 위치가 현재 파일 내용 길이를 벗어날 수 있음(stale content 등) → 클램프해 substring 크래시 방지.
+        int len = contents.length();
+        int begin = Math.max(0, Math.min((int) err.getStartPosition(), len));
+        int end = Math.max(begin, Math.min((int) err.getEndPosition(), len));
         return contents.substring(begin, end);
     }
 
