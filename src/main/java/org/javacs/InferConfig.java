@@ -114,7 +114,39 @@ class InferConfig {
             return bazelClasspath(bazelWorkspaceRoot);
         }
 
+        // 서브디렉토리 모듈: 루트에 빌드파일이 없지만 하위에 Maven/Gradle 모듈이 있는 repo(프로젝트가 subdir에 있는 경우).
+        // 워크스페이스를 repo 루트로 등록했을 때 classpath가 비어 컴파일이 느려지지 않도록, 1뎁스 하위 모듈들에서 union으로 모은다.
+        var subModuleCp = subdirectoryModulesClasspath();
+        if (!subModuleCp.isEmpty()) {
+            return subModuleCp;
+        }
+
         return Collections.emptySet();
+    }
+
+    // 워크스페이스 루트 바로 아래 디렉토리 중 pom.xml / build.gradle(.kts)를 가진 모듈들의 classpath를 union.
+    private Set<Path> subdirectoryModulesClasspath() {
+        var result = new HashSet<Path>();
+        try (var entries = Files.list(workspaceRoot)) {
+            for (var dir : entries.filter(Files::isDirectory).collect(Collectors.toList())) {
+                var name = dir.getFileName().toString();
+                if (name.startsWith(".") || name.equals("build") || name.equals("target")
+                        || name.equals("node_modules") || name.equals("out")) {
+                    continue;
+                }
+                var pom = dir.resolve("pom.xml");
+                if (Files.exists(pom)) {
+                    result.addAll(mvnDependenciesCached(pom, "dependency:list", this.envVars));
+                    continue;
+                }
+                if (Files.exists(dir.resolve("build.gradle")) || Files.exists(dir.resolve("build.gradle.kts"))) {
+                    result.addAll(gradleDependenciesCached(dir, this.envVars));
+                }
+            }
+        } catch (IOException e) {
+            LOG.warning("subdirectory module classpath scan failed: " + e.getMessage());
+        }
+        return result;
     }
 
     private Path bazelWorkspaceRoot() {
