@@ -371,10 +371,22 @@ class InferConfig {
     }
 
     static Set<Path> gradleDependencies(Path workspaceRoot, Map<String, String> envVars) {
+        // 단일 JDK로 모든 repo를 못 맞춘다: 신 Gradle(8.x)+SpringBoot3 플러그인은 Java 17+ 필요,
+        // 구 Gradle(6.x)은 Java 21 미지원(≤16). 그래서 두 번 시도한다:
+        //  1) 실행 JDK(JAVA_HOME, 보통 최신 21) 그대로 — 최신 Gradle/Boot3 repo가 해결됨.
+        //  2) 실패(0 jars) 시 JAVA_HOME 제거(PATH 기본 JDK, 보통 구버전) — 구 Gradle repo가 해결됨.
+        var deps = runGradleClasspath(workspaceRoot, false);
+        if (!deps.isEmpty()) {
+            return deps;
+        }
+        return runGradleClasspath(workspaceRoot, true);
+    }
+
+    private static Set<Path> runGradleClasspath(Path workspaceRoot, boolean removeJavaHome) {
         try {
             var initScript = Files.createTempFile("javacs-gradle-classpath", ".gradle");
             Files.writeString(initScript, GRADLE_CLASSPATH_INIT_SCRIPT);
-            var gradleCmd = gradleCommand(workspaceRoot, envVars);
+            var gradleCmd = gradleCommand(workspaceRoot, System.getenv());
             var command = new ArrayList<String>();
             // 워크스페이스 gradlew는 실행권한(+x)이 없을 수 있어 직접 exec 시 error=13(Permission denied)가 난다.
             // sh로 실행해 권한과 무관하게 동작하게 한다.
@@ -388,17 +400,17 @@ class InferConfig {
             command.add(initScript.toString());
             command.add("sariPrintClasspath");
             var output = Files.createTempFile("javacs-gradle-output", ".txt");
-            LOG.info("Running " + String.join(" ", command) + " in " + workspaceRoot);
+            LOG.info("Running " + String.join(" ", command) + " in " + workspaceRoot
+                    + (removeJavaHome ? " (PATH JDK)" : " (JAVA_HOME JDK)"));
             var pb =
                     new ProcessBuilder()
                             .command(command)
                             .directory(workspaceRoot.toFile())
                             .redirectError(ProcessBuilder.Redirect.INHERIT)
                             .redirectOutput(output.toFile());
-            // 리포의 Gradle 래퍼는 구버전(예: 6.x)이라 실행 JDK(여기선 21)를 지원하지 않을 수 있다
-            // ("Unsupported class file major version"). JAVA_HOME을 제거해 Gradle이 PATH의 기본 JDK
-            // (사용자가 실제 빌드에 쓰는 호환 JDK)를 쓰게 한다.
-            pb.environment().remove("JAVA_HOME");
+            if (removeJavaHome) {
+                pb.environment().remove("JAVA_HOME");
+            }
             var process = pb.start();
             if (!process.waitFor(GRADLE_TIMEOUT_SEC, java.util.concurrent.TimeUnit.SECONDS)) {
                 process.destroyForcibly();
@@ -414,7 +426,8 @@ class InferConfig {
                     }
                 }
             }
-            LOG.info("Gradle classpath resolved " + dependencies.size() + " jars for " + workspaceRoot);
+            LOG.info("Gradle classpath resolved " + dependencies.size() + " jars for " + workspaceRoot
+                    + (removeJavaHome ? " (PATH JDK)" : " (JAVA_HOME JDK)"));
             return dependencies;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
