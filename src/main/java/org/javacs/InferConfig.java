@@ -100,6 +100,14 @@ class InferConfig {
             return mvnDependenciesCached(pomXml, "dependency:list", this.envVars);
         }
 
+        // Gradle — pom.xml이 없는 build.gradle(.kts) 프로젝트. classpath를 해결하지 않으면 javac가
+        // 의존성 타입을 못 찾아 에러 복구 컴파일로 극도로 느려진다(관측: 6분+). Maven과 동일하게 캐시한다.
+        var buildGradle = workspaceRoot.resolve("build.gradle");
+        var buildGradleKts = workspaceRoot.resolve("build.gradle.kts");
+        if (Files.exists(buildGradle) || Files.exists(buildGradleKts)) {
+            return gradleDependenciesCached(workspaceRoot, this.envVars);
+        }
+
         // Bazel
         var bazelWorkspaceRoot = bazelWorkspaceRoot();
         if (Files.exists(bazelWorkspaceRoot.resolve("WORKSPACE"))) {
@@ -305,6 +313,127 @@ class InferConfig {
         // If findExecutableOnPath returns null (e.g. PATH is not set), we should still return "mvn"
         // and let the execution fail later if it's not on the (empty) path.
         return mvnCommand == null ? "mvn" : mvnCommand;
+    }
+
+    // ---- Gradle classpath 해결 (Maven 방식 미러링) ----
+
+    private static final long GRADLE_TIMEOUT_SEC = 180;
+
+    // 해결 가능한 classpath 구성(compile/runtime)의 jar 절대경로를 "SARI_CP <path>"로 출력하는 init 스크립트.
+    // lenientConfiguration + --offline로 다운로드 없이 캐시된 것만 best-effort로 모은다(실패해도 부분 classpath).
+    private static final String GRADLE_CLASSPATH_INIT_SCRIPT =
+            "gradle.rootProject { rp ->\n"
+            + "  rp.tasks.register('sariPrintClasspath') {\n"
+            + "    doLast {\n"
+            + "      def seen = new LinkedHashSet()\n"
+            + "      rp.allprojects.each { p ->\n"
+            + "        p.configurations.each { c ->\n"
+            + "          if (c.canBeResolved && (c.name in ['compileClasspath','runtimeClasspath','testCompileClasspath','testRuntimeClasspath'])) {\n"
+            + "            try { c.resolvedConfiguration.lenientConfiguration.getFiles().each { seen.add(it.absolutePath) } } catch (ignored) {}\n"
+            + "          }\n"
+            + "        }\n"
+            + "      }\n"
+            + "      seen.each { println 'SARI_CP ' + it }\n"
+            + "    }\n"
+            + "  }\n"
+            + "}\n";
+
+    static Set<Path> gradleDependenciesCached(Path workspaceRoot, Map<String, String> envVars) {
+        try {
+            var abs = workspaceRoot.toAbsolutePath();
+            var buildFile = Files.exists(abs.resolve("build.gradle"))
+                    ? abs.resolve("build.gradle") : abs.resolve("build.gradle.kts");
+            var mtime = Files.exists(buildFile) ? Files.getLastModifiedTime(buildFile).toMillis() : 0L;
+            var cacheDir = Paths.get(System.getProperty("user.home"), ".cache", "javacs-classpath");
+            Files.createDirectories(cacheDir);
+            var cacheFile = cacheDir.resolve("gradle-" + Integer.toHexString(abs.toString().hashCode()) + ".txt");
+            if (Files.exists(cacheFile)) {
+                var lines = Files.readAllLines(cacheFile);
+                if (!lines.isEmpty() && lines.get(0).equals("mtime=" + mtime)) {
+                    var deps = new HashSet<Path>();
+                    for (var i = 1; i < lines.size(); i++) {
+                        if (!lines.get(i).isBlank()) deps.add(Paths.get(lines.get(i)));
+                    }
+                    LOG.info("Using cached gradle classpath (" + deps.size() + " jars) for " + abs);
+                    return deps;
+                }
+            }
+            var deps = gradleDependencies(abs, envVars);
+            var out = new ArrayList<String>();
+            out.add("mtime=" + mtime);
+            for (var d : deps) out.add(d.toString());
+            Files.write(cacheFile, out);
+            return deps;
+        } catch (IOException e) {
+            LOG.warning("gradle classpath cache failed, running gradle directly: " + e.getMessage());
+            return gradleDependencies(workspaceRoot, envVars);
+        }
+    }
+
+    static Set<Path> gradleDependencies(Path workspaceRoot, Map<String, String> envVars) {
+        try {
+            var initScript = Files.createTempFile("javacs-gradle-classpath", ".gradle");
+            Files.writeString(initScript, GRADLE_CLASSPATH_INIT_SCRIPT);
+            var gradleCmd = gradleCommand(workspaceRoot, envVars);
+            var command = new ArrayList<String>();
+            // 워크스페이스 gradlew는 실행권한(+x)이 없을 수 있어 직접 exec 시 error=13(Permission denied)가 난다.
+            // sh로 실행해 권한과 무관하게 동작하게 한다.
+            if (gradleCmd.endsWith("gradlew")) {
+                command.add("sh");
+            }
+            command.add(gradleCmd);
+            command.add("--quiet");
+            command.add("--offline");
+            command.add("--init-script");
+            command.add(initScript.toString());
+            command.add("sariPrintClasspath");
+            var output = Files.createTempFile("javacs-gradle-output", ".txt");
+            LOG.info("Running " + String.join(" ", command) + " in " + workspaceRoot);
+            var pb =
+                    new ProcessBuilder()
+                            .command(command)
+                            .directory(workspaceRoot.toFile())
+                            .redirectError(ProcessBuilder.Redirect.INHERIT)
+                            .redirectOutput(output.toFile());
+            // 리포의 Gradle 래퍼는 구버전(예: 6.x)이라 실행 JDK(여기선 21)를 지원하지 않을 수 있다
+            // ("Unsupported class file major version"). JAVA_HOME을 제거해 Gradle이 PATH의 기본 JDK
+            // (사용자가 실제 빌드에 쓰는 호환 JDK)를 쓰게 한다.
+            pb.environment().remove("JAVA_HOME");
+            var process = pb.start();
+            if (!process.waitFor(GRADLE_TIMEOUT_SEC, java.util.concurrent.TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                LOG.severe("gradle classpath resolution timed out (" + GRADLE_TIMEOUT_SEC + "s) for " + workspaceRoot);
+                return Set.of();
+            }
+            var dependencies = new HashSet<Path>();
+            for (var line : Files.readAllLines(output)) {
+                if (line.startsWith("SARI_CP ")) {
+                    var p = Paths.get(line.substring("SARI_CP ".length()).trim());
+                    if (p.toString().endsWith(".jar") && Files.exists(p)) {
+                        dependencies.add(p);
+                    }
+                }
+            }
+            LOG.info("Gradle classpath resolved " + dependencies.size() + " jars for " + workspaceRoot);
+            return dependencies;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return Set.of();
+        } catch (IOException e) {
+            LOG.warning("gradle classpath resolution failed: " + e.getMessage());
+            return Set.of();
+        }
+    }
+
+    // 워크스페이스의 ./gradlew를 우선 사용(버전 일치), 없으면 PATH의 gradle.
+    static String gradleCommand(Path workspaceRoot, Map<String, String> envVars) {
+        var wrapperName = File.separatorChar == '\\' ? "gradlew.bat" : "gradlew";
+        var wrapper = workspaceRoot.resolve(wrapperName);
+        if (Files.exists(wrapper)) {
+            return wrapper.toAbsolutePath().toString();
+        }
+        var onPath = findExecutableOnPath(File.separatorChar == '\\' ? "gradle.bat" : "gradle", envVars);
+        return onPath == null ? "gradle" : onPath;
     }
 
     private static String findExecutableOnPath(String name, Map<String, String> envVars) {
