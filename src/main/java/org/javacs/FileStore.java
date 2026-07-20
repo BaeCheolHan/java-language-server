@@ -60,20 +60,49 @@ public class FileStore {
 
     private static void addFiles(Path root) {
         try {
-            Files.walkFileTree(root, new FindJavaSources());
+            Files.walkFileTree(root, new FindJavaSources(root));
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
     }
 
     static class FindJavaSources extends SimpleFileVisitor<Path> {
+        private final Path root;
+
+        FindJavaSources(Path root) {
+            this.root = root;
+        }
+
         @Override
         public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attrs) {
             if (attrs.isSymbolicLink()) {
                 LOG.warning("Don't check " + dir + " for java sources");
                 return FileVisitResult.SKIP_SUBTREE;
             }
+            var name = dir.getFileName();
+            if (name != null && name.toString().equals(".git")) {
+                return FileVisitResult.SKIP_SUBTREE;
+            }
+            if (!dir.equals(root)
+                    && name != null
+                    && isOutputDirectory(name.toString())
+                    && !hasSrcSegment(root.relativize(dir))) {
+                return FileVisitResult.SKIP_SUBTREE;
+            }
             return FileVisitResult.CONTINUE;
+        }
+
+        private boolean isOutputDirectory(String name) {
+            return name.equals("build") || name.equals("bin") || name.equals("target") || name.equals("out");
+        }
+
+        private boolean hasSrcSegment(Path relative) {
+            for (var segment : relative) {
+                if (segment.toString().equals("src")) {
+                    return true;
+                }
+            }
+            return false;
         }
 
         @Override
