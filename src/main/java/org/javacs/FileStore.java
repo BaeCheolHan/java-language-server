@@ -83,6 +83,12 @@ public class FileStore {
             if (name != null && name.toString().equals(".git")) {
                 return FileVisitResult.SKIP_SUBTREE;
             }
+            // 중첩 git checkout(worktree/submodule/nested clone) 루트는 .git(worktree는 파일, clone은 dir)을
+            // 가진다 — 소스 복제본이라 컴파일하면 중복 클래스로 참조가 복제본 경로에 귀속돼 소실된다
+            // (sari L5 참조 98% drop 근본원인: .worktrees/*/src 중복). root 자신은 제외.
+            if (!dir.equals(root) && Files.exists(dir.resolve(".git"))) {
+                return FileVisitResult.SKIP_SUBTREE;
+            }
             if (!dir.equals(root)
                     && name != null
                     && isOutputDirectory(name.toString())
