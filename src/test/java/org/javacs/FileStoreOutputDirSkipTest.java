@@ -55,4 +55,24 @@ public class FileStoreOutputDirSkipTest {
 
         assertThat(FileStore.all(), containsInAnyOrder(source, realPackage));
     }
+
+    /** 중첩 git checkout(worktree/submodule/nested clone)은 소스 복제본이라 스킵한다. worktree 루트는
+     *  {@code .git} 파일(gitdir: 포인터)을 갖는다 — 이걸 컴파일하면 중복 클래스로 참조가 복제본에
+     *  귀속돼 소실된다(sari L5 참조 98% drop 실사고). 컨테이너(.git 없음)는 들어가되, .git 보유 하위는 스킵. */
+    @Test
+    public void skipsNestedGitWorktreeDirectories() throws Exception {
+        Path root = Files.createTempDirectory("filestore-nested-git");
+        Path source = root.resolve("src/main/java/A.java");
+        Path worktreeMarker = root.resolve(".worktrees/wt/.git");
+        Path worktreeSource = root.resolve(".worktrees/wt/src/main/java/A.java");
+        Files.createDirectories(source.getParent());
+        Files.createDirectories(worktreeSource.getParent());
+        Files.writeString(source, "class A {}\n");
+        Files.writeString(worktreeMarker, "gitdir: /elsewhere/.git/worktrees/wt\n");
+        Files.writeString(worktreeSource, "class A {}\n");
+
+        FileStore.setWorkspaceRoots(Set.of(root));
+
+        assertThat(FileStore.all(), containsInAnyOrder(source));
+    }
 }
