@@ -352,7 +352,13 @@ class InferConfig {
     private static final long GRADLE_TIMEOUT_SEC = 180;
 
     // 해결 가능한 classpath 구성(compile/runtime)의 jar 절대경로를 "SARI_CP <path>"로 출력하는 init 스크립트.
-    // lenientConfiguration + --offline로 다운로드 없이 캐시된 것만 best-effort로 모은다(실패해도 부분 classpath).
+    // lenient view + --offline로 다운로드 없이 캐시된 것만 best-effort로 모은다(실패해도 부분 classpath).
+    //
+    // artifactView(lenient)가 현행 API다. 이전 판은 resolvedConfiguration.lenientConfiguration.getFiles()를
+    // 썼는데 Gradle 9가 그 메서드를 없앴고, 예외를 catch(ignored){}로 삼켜 "의존성 0개"가 정상 응답으로
+    // 나갔다 — 그 빈 결과가 캐시에 굳으면 해당 repo는 의존성 없이 컴파일되고 참조 인덱서가 죽는다
+    // (2026-07-30 실측: MissingMethodException → SARI_CP 0건 → AssertionError로 LSP 사망).
+    // 구 Gradle 대비 폴백을 남기되, 둘 다 실패하면 SARI_FAIL로 <b>드러낸다</b>.
     private static final String GRADLE_CLASSPATH_INIT_SCRIPT =
             "gradle.rootProject { rp ->\n"
             + "  rp.tasks.register('sariPrintClasspath') {\n"
@@ -361,7 +367,11 @@ class InferConfig {
             + "      rp.allprojects.each { p ->\n"
             + "        p.configurations.each { c ->\n"
             + "          if (c.canBeResolved && (c.name in ['compileClasspath','runtimeClasspath','testCompileClasspath','testRuntimeClasspath'])) {\n"
-            + "            try { c.resolvedConfiguration.lenientConfiguration.getFiles().each { seen.add(it.absolutePath) } } catch (ignored) {}\n"
+            + "            try { c.incoming.artifactView { it.lenient = true }.files.each { seen.add(it.absolutePath) } }\n"
+            + "            catch (Throwable modern) {\n"
+            + "              try { c.resolvedConfiguration.lenientConfiguration.getFiles().each { seen.add(it.absolutePath) } }\n"
+            + "              catch (Throwable legacy) { println 'SARI_FAIL ' + p.path + ':' + c.name + ' ' + modern }\n"
+            + "            }\n"
             + "          }\n"
             + "        }\n"
             + "      }\n"
@@ -391,6 +401,15 @@ class InferConfig {
                 }
             }
             var deps = gradleDependencies(abs, envVars);
+            if (deps.isEmpty()) {
+                // 빈 결과는 캐시하지 않는다. 캐시 무효화 조건이 build.gradle mtime 이라, 실패로 얻은
+                // 0 jars 를 저장하면 빌드 파일을 건드리기 전까지 <b>영구히</b> 의존성 없는 classpath 로
+                // 컴파일한다 — 그 상태에서 참조 인덱서가 AssertionError 로 죽는 것을 2026-07-30 에
+                // 실측했다. "0개"가 진짜인 프로젝트는 매번 재해석하는 비용을 내지만, 조용히 굳는
+                // 것보다 낫다.
+                LOG.warning("Gradle classpath resolved 0 jars for " + abs + " — not caching (see SARI_FAIL above)");
+                return deps;
+            }
             var out = new ArrayList<String>();
             out.add("mtime=" + mtime);
             for (var d : deps) out.add(d.toString());
@@ -451,6 +470,11 @@ class InferConfig {
             }
             var dependencies = new HashSet<Path>();
             for (var line : Files.readAllLines(output)) {
+                if (line.startsWith("SARI_FAIL ")) {
+                    // 구성 하나가 해결 실패했다는 뜻. 이걸 침묵하면 "0 jars" 가 정상 결과로 읽힌다.
+                    LOG.warning("Gradle classpath resolution failed for " + line.substring("SARI_FAIL ".length()));
+                    continue;
+                }
                 if (line.startsWith("SARI_CP ")) {
                     var p = Paths.get(line.substring("SARI_CP ".length()).trim());
                     if (p.toString().endsWith(".jar") && Files.exists(p)) {
