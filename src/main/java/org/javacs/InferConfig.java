@@ -352,7 +352,13 @@ class InferConfig {
     private static final long GRADLE_TIMEOUT_SEC = 180;
 
     // 해결 가능한 classpath 구성(compile/runtime)의 jar 절대경로를 "SARI_CP <path>"로 출력하는 init 스크립트.
-    // lenientConfiguration + --offline로 다운로드 없이 캐시된 것만 best-effort로 모은다(실패해도 부분 classpath).
+    // lenient artifactView + --offline로 다운로드 없이 캐시된 것만 best-effort로 모은다(실패해도 부분 classpath).
+    //
+    // resolvedConfiguration.lenientConfiguration.getFiles() 를 쓰면 안 된다 — Gradle 9 에서 제거됐고,
+    // 그 자리의 catch 가 MissingMethodException 을 삼켜 **조용히 0 jars** 가 된다. 그러면 javacs 가
+    // 심볼을 하나도 해석하지 못한 채 인덱싱하고, switch 표현식 같은 구문에서 javac 내부 AssertionError
+    // 로 프로세스가 죽는다(2026-07-31 실측: 이 코퍼스의 gradle 캐시 13개가 전부 0 jars 였다).
+    // 실패를 삼키지 않도록 SARI_ERR 로 뱉는다 — 소비자는 SARI_CP 접두만 읽으므로 파싱에 영향이 없다.
     private static final String GRADLE_CLASSPATH_INIT_SCRIPT =
             "gradle.rootProject { rp ->\n"
             + "  rp.tasks.register('sariPrintClasspath') {\n"
@@ -361,7 +367,13 @@ class InferConfig {
             + "      rp.allprojects.each { p ->\n"
             + "        p.configurations.each { c ->\n"
             + "          if (c.canBeResolved && (c.name in ['compileClasspath','runtimeClasspath','testCompileClasspath','testRuntimeClasspath'])) {\n"
-            + "            try { c.resolvedConfiguration.lenientConfiguration.getFiles().each { seen.add(it.absolutePath) } } catch (ignored) {}\n"
+            + "            def added = false\n"
+            + "            try { c.incoming.artifactView { av -> av.lenient = true }.files.each { seen.add(it.absolutePath); added = true } }\n"
+            + "            catch (e1) { println 'SARI_ERR artifactView ' + e1 }\n"
+            + "            if (!added) {\n"
+            + "              try { c.resolvedConfiguration.lenientConfiguration.getFiles().each { seen.add(it.absolutePath) } }\n"
+            + "              catch (e2) { println 'SARI_ERR lenient ' + e2 }\n"
+            + "            }\n"
             + "          }\n"
             + "        }\n"
             + "      }\n"
@@ -386,11 +398,27 @@ class InferConfig {
                     for (var i = 1; i < lines.size(); i++) {
                         if (!lines.get(i).isBlank()) deps.add(Paths.get(lines.get(i)));
                     }
-                    LOG.info("Using cached gradle classpath (" + deps.size() + " jars) for " + abs);
-                    return deps;
+                    // 빈 캐시는 캐시 미스로 취급한다. 쓰기 쪽에서 0 jars 저장을 막아도 **그 수정
+                    // 이전에 굳은 파일은 계속 읽힌다** — 캐시 키가 build.gradle mtime 이라 빌드 파일을
+                    // 건드리지 않는 한 영원히. 2026-07-31 에 이 코퍼스의 캐시 13개가 전부 0 jars 로
+                    // 남아 있었고, 그 탓에 javacs 가 심볼을 하나도 해석하지 못한 채 인덱싱하다
+                    // switch 표현식에서 javac 내부 AssertionError 로 죽었다.
+                    if (deps.isEmpty()) {
+                        LOG.warning("cached gradle classpath is empty for " + abs + " — ignoring cache and re-resolving");
+                    } else {
+                        LOG.info("Using cached gradle classpath (" + deps.size() + " jars) for " + abs);
+                        return deps;
+                    }
                 }
             }
             var deps = gradleDependencies(abs, envVars);
+            if (deps.isEmpty()) {
+                // 빈 결과는 캐시하지 않는다. 캐시 키가 build.gradle mtime 이라, 한 번 실패한 추출을
+                // 저장해 버리면 빌드 파일을 건드릴 때까지 **영원히 0 jars 를 재사용**한다. 실제로 이
+                // 코퍼스의 gradle 캐시 13개가 전부 그 상태로 굳어 있었다(2026-07-31).
+                LOG.warning("gradle classpath resolved to 0 jars for " + abs + " — not caching, will retry");
+                return deps;
+            }
             var out = new ArrayList<String>();
             out.add("mtime=" + mtime);
             for (var d : deps) out.add(d.toString());
