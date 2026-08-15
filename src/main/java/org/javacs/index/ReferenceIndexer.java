@@ -26,7 +26,8 @@ import org.javacs.CompilerProvider;
  * 타겟 키는 org.javacs documentSymbol(SymbolProvider/FindSymbolsMatching)의 nameLocation과 동일하게 계산되어
  * 클라이언트(sari)가 저장한 심볼 키와 정확히 조인된다.
  *
- * <p>reconciliation 검증됨(checkout-service, SampleVo 27/27 = FindReferences 의미와 일치).
+ * <p>reconciliation 검증됨: 한 서비스 레포의 값 객체 하나에 대해 이 인덱서가 낸 엣지가 표준
+ * FindReferences 결과와 <b>전건 일치</b>했다(의미가 같다는 확인이지 성능 수치가 아니다).
  */
 public class ReferenceIndexer {
 
@@ -56,6 +57,28 @@ public class ReferenceIndexer {
         }
     }
 
+    /**
+     * 배치 한 번의 결과. <b>엣지 목록만으로는 "컴파일했는데 참조가 없다" 와 "컴파일이 깨져서 빈 결과다"
+     * 를 구별할 수 없다</b> — 둘 다 빈 배열이다. 클라이언트가 그 빈 결과를 성공으로 읽으면 기존 참조를
+     * 지우고 완료 도장을 찍는다. 그래서 두 값을 함께 싣는다.
+     *
+     * <p>{@code compiledFiles == 0} 이면 <b>javac 를 돌리지도 않았다</b>(컴파일 대상이 비었다).
+     * {@code errorDiagnostics > 0} 이면 컴파일은 했으나 해소 실패가 있었다는 뜻이라 엣지가 불완전할 수 있다.
+     * 클라이언트는 {@code compiledFiles > 0 && errorDiagnostics == 0 && edges 가 빔} 인 경우에만
+     * "참조가 진짜 없다" 로 확정할 수 있다.
+     */
+    public static final class IndexResult {
+        public final int compiledFiles;      // javac 에 실제로 넘긴 소스 파일 수
+        public final int errorDiagnostics;   // 이번 컴파일의 ERROR 심각도 진단 수
+        public final List<Edge> edges;
+
+        IndexResult(int compiledFiles, int errorDiagnostics, List<Edge> edges) {
+            this.compiledFiles = compiledFiles;
+            this.errorDiagnostics = errorDiagnostics;
+            this.edges = edges;
+        }
+    }
+
     private final CompilerProvider compiler;
     private final Path workspaceRoot;
 
@@ -68,8 +91,11 @@ public class ReferenceIndexer {
      * compileFiles를 배치 컴파일하고, walkFiles(널이면 전체)의 참조 엣지를 추출한다.
      * 배치: compileFiles=walkFiles=워크스페이스 전체. 증분: compileFiles=변경파일+이웃, walkFiles={변경파일}.
      */
-    public List<Edge> index(Collection<Path> compileFiles, Set<Path> walkFiles) {
-        if (compileFiles.isEmpty()) return List.of();
+    public IndexResult index(Collection<Path> compileFiles, Set<Path> walkFiles) {
+        // 컴파일 대상이 없으면 javac 를 아예 돌리지 않는다 — 그 사실이 compiledFiles=0 으로 드러나야
+        // 클라이언트가 "참조 없음" 으로 오독하지 않는다. 이 경로가 이 클래스에서 유일하게 컴파일을
+        // 건너뛰는 자리다.
+        if (compileFiles.isEmpty()) return new IndexResult(0, 0, List.of());
         long tStart = System.nanoTime();
         try (var task = compiler.compile(compileFiles.toArray(Path[]::new))) {
             var trees = Trees.instance(task.task);
@@ -95,10 +121,17 @@ public class ReferenceIndexer {
                 collectRefs(cu, trees, pos, declKey, workspaceRoot.relativize(refFile).toString(), edges, seen);
             }
             long tPass2 = System.nanoTime();
-            LOG.info(String.format("ReferenceIndexer: compiled=%d declSymbols=%d edges=%d | compileMs=%d pass1Ms=%d pass2Ms=%d",
-                    compileFiles.size(), declKey.size(), edges.size(),
+            // task.diagnostics 는 JavaCompilerService 의 **공유 리스트 참조**다(복사본이 아니다).
+            // 다음 컴파일이 clear 하므로 반드시 이 블록 안에서 센다. 그리고 -Xmaxerrs 가 매우 크게
+            // 잡혀 있어 목록이 방대할 수 있으므로 **개수만** 싣는다.
+            int errorDiagnostics = 0;
+            for (var d : task.diagnostics) {
+                if (d.getKind() == javax.tools.Diagnostic.Kind.ERROR) errorDiagnostics++;
+            }
+            LOG.info(String.format("ReferenceIndexer: compiled=%d declSymbols=%d edges=%d errors=%d | compileMs=%d pass1Ms=%d pass2Ms=%d",
+                    compileFiles.size(), declKey.size(), edges.size(), errorDiagnostics,
                     (tCompiled - tStart) / 1_000_000L, (tPass1 - tCompiled) / 1_000_000L, (tPass2 - tPass1) / 1_000_000L));
-            return edges;
+            return new IndexResult(compileFiles.size(), errorDiagnostics, edges);
         }
     }
 

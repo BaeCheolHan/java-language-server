@@ -459,10 +459,25 @@ public class LSP {
                     default:
                         LOG.warning(String.format("Don't know what to do with method `%s`", r.method));
                 }
-            } catch (Exception e) {
-                LOG.log(Level.SEVERE, e.getMessage(), e);
+            } catch (Exception | AssertionError | StackOverflowError e) {
+                // AssertionError 를 함께 잡는 이유: javac 내부(Attr 계열 lazy attribution)가 해소할 수 없는
+                // 타입을 만나면 AssertionError 를 던지는데, 그건 Error 라 이 catch 를 그냥 통과해
+                // Main 의 catch(Throwable) → System.exit(1) 까지 간다. **요청 하나가 서버 프로세스를 죽이고**
+                // 대기 중인 다른 요청은 응답 없이 사라진다. 상류에도 같은 취지의 가드(catchJavacError)가
+                // 있었는데 컴파일러 재작성 과정에서 유실됐다.
+                //
+                // Throwable 로 넓히지 말 것 — OutOfMemoryError 는 계속 프로세스를 내려야 한다.
+                //
+                // 회복 가능성: 컴파일 경로가 try-with-resources 라 Error 로 빠져나가도 CompileBatch.close()
+                // 가 돌고, 오염된 javac 컨텍스트는 다음 compile 의 borrow.close() → ctx.clear() 로 폐기된다.
+                // 즉 여기서 잡아도 서버는 계속 쓸 수 있다.
+                //
+                // 메시지를 그대로 쓰지 않는 이유: AssertionError 는 getMessage() 가 null 인 경우가 흔해서
+                // 로그와 응답이 "null" 한 줄이 된다 — 무엇이 터졌는지 지목하지 못한다.
+                var detail = e.getClass().getName() + (e.getMessage() == null ? "" : ": " + e.getMessage());
+                LOG.log(Level.SEVERE, detail, e);
                 if (r.id != null) {
-                    error(send, r.id, new ResponseError(ErrorCodes.InternalError, e.getMessage(), null));
+                    error(send, r.id, new ResponseError(ErrorCodes.InternalError, detail, null));
                 }
             }
         }
