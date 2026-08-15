@@ -274,7 +274,10 @@ class ReusableCompiler {
                 this.context = context;
             }
 
-            void clear() {
+            // public 이어야 한다: JDK 25 부터 com.sun.tools.javac.util.Log.clear() 가 public 이라
+            // package-private 오버라이드는 "접근 제한자를 좁힌다" 로 컴파일이 실패한다.
+            // JDK 21 에서도 유효하다 — 오버라이드에서 접근 범위를 넓히는 것은 언제나 허용된다.
+            public void clear() {
                 recorded.clear();
                 sourceMap.clear();
                 nerrors = 0;
