@@ -260,11 +260,26 @@ class InferConfig {
                     for (var i = 1; i < lines.size(); i++) {
                         if (!lines.get(i).isBlank()) deps.add(Paths.get(lines.get(i)));
                     }
-                    LOG.info("Using cached classpath (" + deps.size() + " jars) for " + abs);
-                    return deps;
+                    // 빈 캐시는 캐시 미스로 취급한다 — gradle 경로와 같은 이유다. 쓰기 쪽에서 0 jars
+                    // 저장을 막아도 **그 수정 이전에 굳은 파일은 계속 읽힌다**. 캐시 키가 pom.xml
+                    // mtime 이라 pom 을 건드리지 않는 한 영원히 재사용된다.
+                    if (deps.isEmpty()) {
+                        LOG.warning("cached mvn classpath is empty for " + abs + " — ignoring cache and re-resolving");
+                    } else {
+                        LOG.info("Using cached classpath (" + deps.size() + " jars) for " + abs);
+                        return deps;
+                    }
                 }
             }
             var deps = mvnDependencies(pomXml, goal, envVars);
+            if (deps.isEmpty()) {
+                // 빈 결과는 캐시하지 않는다. mvnDependencies 는 mvn 프로세스가 exit≠0 이면(부모 POM
+                // 부재·오프라인·mvn 미설치 등) 빈 Set 을 돌려주는데, 그것을 저장하면 pom 을 건드릴
+                // 때까지 **영원히 0 jars 를 재사용**한다. 빈 classpath 로 도는 javac 는 느릴 뿐 아니라
+                // 어떤 소스에서는 내부 AssertionError 로 죽는다 — gradle 경로에서 실제로 겪은 부류다.
+                LOG.warning("mvn classpath resolved to 0 jars for " + abs + " — not caching, will retry");
+                return deps;
+            }
             var out = new ArrayList<String>();
             out.add("mtime=" + mtime);
             for (var d : deps) out.add(d.toString());
