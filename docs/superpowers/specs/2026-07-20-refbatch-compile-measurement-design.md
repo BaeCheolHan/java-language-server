@@ -7,7 +7,7 @@
 ## 배경 / 동기
 - sari-java 콜드스타트 인덱싱의 지배 비용 = L5 참조배치 javac 컴파일(perf handoff 2026-07-17: 참조배치 워커시간 ~97%, ~2,500s CPU, tail 764파일 262s).
 - 포크는 `java/indexReferences`로 워크스페이스 전체를 1회 컴파일하고 2-pass AST로 (target→reference) 엣지를 방출(`ReferenceIndexer`, 전체배치는 `FileStore.all()`). `FileStore.FindJavaSources`는 심볼릭 링크만 스킵 — `build/`·`bin/`·`generated`를 안 거른다.
-- 대표 표본 hub-api(Gradle 멀티모듈 14): main 3120 / test 182 / **생성·빌드 산출물 ~840(build/generated 431 + bin/generated-sources ~409)**, Lombok 1529. 진짜 의심 덩어리는 생성/빌드 산출물(~24%)이나, `bin`(Eclipse)·`build`(Gradle QueryDSL Q클래스)는 중복이고 포크는 Lombok만 processor로 올려 QueryDSL APT를 안 돌리므로 `build/generated` 제거 시 `QUser` 등 참조가 깨질 수 있다 → **순진한 제외는 이득 작거나 위험 → 먼저 측정.**
+- 대표 표본 hub-api(Gradle 멀티모듈): 소스의 대부분이 main 이고 Lombok 사용률이 높다. **생성·빌드 산출물이 전체의 ~24%**(build/generated + bin/generated-sources 가 비슷한 규모로 양분). 진짜 의심 덩어리는 그 생성/빌드 산출물이나, `bin`(Eclipse)·`build`(Gradle QueryDSL Q클래스)는 중복이고 포크는 Lombok만 processor로 올려 QueryDSL APT를 안 돌리므로 `build/generated` 제거 시 `QUser` 등 참조가 깨질 수 있다 → **순진한 제외는 이득 작거나 위험 → 먼저 측정.**
 
 ## 측정 유효성의 핵심 제약 (codex 1차 리뷰)
 `SourceFileManager.list(SOURCE_PATH)`가 `compileFiles`(roots)와 무관하게 `FileStore.list(pkg)`로 **워크스페이스 전체 소스를 노출**(SourceFileManager.java:25,69). 따라서 roots에서 파일을 빼도 javac가 sourcepath로 도로 끌어온다 — **실제 제외는 FileStore가 보는 트리 자체를 좁혀야** 한다. `getJavaLanguageServer(root)`→`FileStore.setWorkspaceRoots(root)`(JavaLanguageServer.java:173, FileStore.java:37)이므로 **스테이징 트리를 루트로 주면 SOURCE_PATH가 그 트리로 한정**된다. FileStore가 심볼릭 링크를 스킵하니 **하드링크(폴백 복사)**로 만든다.
