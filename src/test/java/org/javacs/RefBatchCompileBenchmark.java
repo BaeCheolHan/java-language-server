@@ -106,7 +106,9 @@ public class RefBatchCompileBenchmark {
         List<ReferenceIndexer.Edge> edges;
         IndexerLog.Timing timing;
         try (var cap = new IndexerLog.Capture()) {
-            edges = new ReferenceIndexer(compiler, root).index(compileFiles, walkFiles);
+            // index() 는 정직성 신호(compiledFiles/errorDiagnostics)를 함께 싣도록 IndexResult 를
+            // 돌려준다 — 이 하네스는 엣지만 쓴다.
+            edges = new ReferenceIndexer(compiler, root).index(compileFiles, walkFiles).edges;
             List<IndexerLog.Timing> ts = cap.timings();
             if (ts.size() != 1) throw new IllegalStateException("ReferenceIndexer 타이밍 로그 " + ts.size() + "개(1개 기대)");
             timing = ts.get(0);
