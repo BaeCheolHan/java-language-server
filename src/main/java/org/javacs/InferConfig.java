@@ -369,11 +369,12 @@ class InferConfig {
     // 해결 가능한 classpath 구성(compile/runtime)의 jar 절대경로를 "SARI_CP <path>"로 출력하는 init 스크립트.
     // lenient artifactView + --offline로 다운로드 없이 캐시된 것만 best-effort로 모은다(실패해도 부분 classpath).
     //
-    // resolvedConfiguration.lenientConfiguration.getFiles() 를 쓰면 안 된다 — Gradle 9 에서 제거됐고,
-    // 그 자리의 catch 가 MissingMethodException 을 삼켜 **조용히 0 jars** 가 된다. 그러면 javacs 가
-    // 심볼을 하나도 해석하지 못한 채 인덱싱하고, switch 표현식 같은 구문에서 javac 내부 AssertionError
-    // 로 프로세스가 죽는다(2026-07-31 실측: 이 코퍼스의 gradle 캐시 13개가 전부 0 jars 였다).
-    // 실패를 삼키지 않도록 SARI_ERR 로 뱉는다 — 소비자는 SARI_CP 접두만 읽으므로 파싱에 영향이 없다.
+    // artifactView(lenient)가 현행 API다. 이전 판은 resolvedConfiguration.lenientConfiguration.getFiles()를
+    // 썼는데 Gradle 9 가 그 메서드를 없앴고, 예외를 catch(ignored){}로 삼켜 "의존성 0개"가 정상 응답으로
+    // 나갔다 — 그 빈 결과가 캐시에 굳으면 그 repo 는 의존성 없이 컴파일되고, switch 표현식 같은 구문에서
+    // javac 내부 AssertionError 로 참조 인덱서가 죽는다(2026-07-30·07-31 실측: 이 코퍼스의 gradle 캐시가
+    // 전부 0 jars 였다). 구 Gradle 대비 폴백을 남기되, 실패는 삼키지 않고 드러낸다 — 소비자는 SARI_CP
+    // 접두만 읽으므로 진단 출력이 파싱에 영향을 주지 않는다.
     private static final String GRADLE_CLASSPATH_INIT_SCRIPT =
             "gradle.rootProject { rp ->\n"
             + "  rp.tasks.register('sariPrintClasspath') {\n"
@@ -383,11 +384,13 @@ class InferConfig {
             + "        p.configurations.each { c ->\n"
             + "          if (c.canBeResolved && (c.name in ['compileClasspath','runtimeClasspath','testCompileClasspath','testRuntimeClasspath'])) {\n"
             + "            def added = false\n"
+            // 예외가 아니라 **빈 결과**일 때도 폴백해야 한다 — Gradle 9 의 artifactView 는
+            // 던지지 않고 0건을 돌려주는 경우가 있어, catch 만 보면 그대로 0 jars 가 된다.
             + "            try { c.incoming.artifactView { av -> av.lenient = true }.files.each { seen.add(it.absolutePath); added = true } }\n"
-            + "            catch (e1) { println 'SARI_ERR artifactView ' + e1 }\n"
+            + "            catch (Throwable modern) { println 'SARI_ERR artifactView ' + p.path + ':' + c.name + ' ' + modern }\n"
             + "            if (!added) {\n"
             + "              try { c.resolvedConfiguration.lenientConfiguration.getFiles().each { seen.add(it.absolutePath) } }\n"
-            + "              catch (e2) { println 'SARI_ERR lenient ' + e2 }\n"
+            + "              catch (Throwable legacy) { println 'SARI_FAIL ' + p.path + ':' + c.name + ' ' + legacy }\n"
             + "            }\n"
             + "          }\n"
             + "        }\n"
@@ -428,10 +431,12 @@ class InferConfig {
             }
             var deps = gradleDependencies(abs, envVars);
             if (deps.isEmpty()) {
-                // 빈 결과는 캐시하지 않는다. 캐시 키가 build.gradle mtime 이라, 한 번 실패한 추출을
-                // 저장해 버리면 빌드 파일을 건드릴 때까지 **영원히 0 jars 를 재사용**한다. 실제로 이
-                // 코퍼스의 gradle 캐시 13개가 전부 그 상태로 굳어 있었다(2026-07-31).
-                LOG.warning("gradle classpath resolved to 0 jars for " + abs + " — not caching, will retry");
+                // 빈 결과는 캐시하지 않는다. 캐시 무효화 조건이 build.gradle mtime 이라, 실패로 얻은
+                // 0 jars 를 저장하면 빌드 파일을 건드리기 전까지 <b>영구히</b> 의존성 없는 classpath 로
+                // 컴파일한다 — 그 상태에서 참조 인덱서가 AssertionError 로 죽는 것을 2026-07-30 에
+                // 실측했다. "0개"가 진짜인 프로젝트는 매번 재해석하는 비용을 내지만, 조용히 굳는
+                // 것보다 낫다.
+                LOG.warning("Gradle classpath resolved 0 jars for " + abs + " — not caching (see SARI_FAIL above)");
                 return deps;
             }
             var out = new ArrayList<String>();
@@ -494,6 +499,11 @@ class InferConfig {
             }
             var dependencies = new HashSet<Path>();
             for (var line : Files.readAllLines(output)) {
+                if (line.startsWith("SARI_FAIL ")) {
+                    // 구성 하나가 해결 실패했다는 뜻. 이걸 침묵하면 "0 jars" 가 정상 결과로 읽힌다.
+                    LOG.warning("Gradle classpath resolution failed for " + line.substring("SARI_FAIL ".length()));
+                    continue;
+                }
                 if (line.startsWith("SARI_CP ")) {
                     var p = Paths.get(line.substring("SARI_CP ".length()).trim());
                     if (p.toString().endsWith(".jar") && Files.exists(p)) {
